@@ -1,3 +1,4 @@
+"""Demonstrates handler logging behavior in Python."""
 import logging
 from pathlib import Path
 

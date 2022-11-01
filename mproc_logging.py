@@ -1,4 +1,5 @@
 """Demonstrates a basic example of logging in multiple processes."""
+import queue
 from pathlib import Path
 import logging
 import logging.handlers
@@ -6,99 +7,105 @@ import multiprocessing
 from random import choice, random
 import time
 
-#
-# Because you'll want to define the logging configurations for listener and workers, the
-# listener and worker process functions take a configurer parameter which is a callable
-# for configuring logging for that process. These functions are also passed the queue,
-# which they use for communication.
-#
-# In practice, you can configure the listener however you want, but note that in this
-# simple example, the listener does not apply level or filter logic to received records.
-# In practice, you would probably want to do this logic in the worker processes, to avoid
-# sending events which would be filtered out between processes.
-#
-# The size of the rotated files is made small so you can see the results easily.
-def listener_configurer():
-    root = logging.getLogger()
-    filename = f'{Path(__file__).stem}.log'
-    h = logging.handlers.RotatingFileHandler(filename, 'a', 300, 10)
-    f = logging.Formatter('%(asctime)s %(processName)-10s %(name)s %(levelname)-8s %(message)s')
-    h.setFormatter(f)
-    root.addHandler(h)
 
-# This is the listener process top-level loop: wait for logging events
-# (LogRecords)on the queue and handle them, quit when you get a None for a
-# LogRecord.
-def listener_process(queue, configurer):
+FMT = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(process)d - %(message)s')
+FILENAME = f'{Path(__file__).stem}.log'
+
+LOGGERS = ['banana', 'ghostwriter', 'superman']
+LEVEL = logging.DEBUG
+
+FILEROTATION_MAXBYTES = 5000
+FILEROTATION_NBACKUPS = 3
+
+
+def listener_configurer():
+    """Configuration of the listener process"""
+    fh = logging.handlers.RotatingFileHandler(FILENAME, 'a', FILEROTATION_MAXBYTES, FILEROTATION_NBACKUPS)
+    fh.setFormatter(FMT)
+    logging.getLogger().addHandler(fh)
+
+
+def listener_process(queue: queue.Queue, configurer: callable):
+    """Listener process lop-level loop.
+
+    Here we wait for logging events stacket into the queue and handle them; quit when you get a None.
+    """
     configurer()
     while True:
         try:
-            record = queue.get()
-            if record is None:  # We send this as a sentinel to tell the listener to quit.
+            # Get and remove the oldest log-record (FIFO queue)
+            record = queue.get()        # type: logging.LogRecord
+            if record is None:
                 break
             logger = logging.getLogger(record.name)
-            logger.handle(record)  # No level or filter logic applied - just do it!
+            logger.handle(record)
         except Exception:
             import sys, traceback
             print('Whoops! Problem:', file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
-# Arrays used for random selections in this demo
 
-LEVELS = [logging.DEBUG, logging.INFO, logging.WARNING,
-          logging.ERROR, logging.CRITICAL]
+def worker_configurer(queue: queue.Queue):
+    """The worker configuration is done at the start of the worker process run.
 
-LOGGERS = ['a.b.c', 'd.e.f']
+    This mainly adds the queue for handling the logs. Log messages are then added in the form of ``logggin.LogRecords`
+    objects to the `queue.
+    """
+    qh = logging.handlers.QueueHandler(queue)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(qh)
+    root_logger.setLevel(logging.DEBUG)
 
-MESSAGES = [
-    'Random message #1',
-    'Random message #2',
-    'Random message #3',
-]
 
-# The worker configuration is done at the start of the worker process run.
-# Note that on Windows you can't rely on fork semantics, so each process
-# will run the logging configuration code when it starts.
-def worker_configurer(queue):
-    h = logging.handlers.QueueHandler(queue)  # Just the one handler needed
-    root = logging.getLogger()
-    root.addHandler(h)
-    # send all messages, for demo; no other level or filter logic applied.
-    root.setLevel(logging.DEBUG)
+def worker_process(queue: queue.Queue, configurer: callable):
+    """Worker process top-level loop.
 
-# This is the worker process top-level loop, which just logs ten events with
-# random intervening delays before terminating.
-# The print messages are just so you know it's doing something!
-def worker_process(queue, configurer):
+    Here we do nothing but wait a random number of seconds between 0 and 1 and log the waited time.
+    """
     configurer(queue)
     name = multiprocessing.current_process().name
-    print('Worker started: %s' % name)
     for i in range(10):
-        time.sleep(random())
+        sleeping_time = random()
+        time.sleep(sleeping_time)
         logger = logging.getLogger(choice(LOGGERS))
-        level = choice(LEVELS)
-        message = choice(MESSAGES)
-        logger.log(level, message)
-    print('Worker finished: %s' % name)
+        message = f'Child proces "{name}" step {i}: slept for {sleeping_time}[s] '
 
-# Here's where the demo gets orchestrated. Create the queue, create and start
-# the listener, create ten workers and start them, wait for them to finish,
-# then send a None to the queue to tell the listener to finish.
+        # Add `logging.LogRecord` to the queue
+        logger.log(LEVEL, message)
+
+
 def main():
+    """Orchestration of this demonstration.
+
+    Single steps are
+        - Create queue
+        - Create and start the listener process
+        - Create and start 10 worker processes
+        - Wait for all workers to finish
+        - Stop the listener process
+    """
+    # Create queue
     queue = multiprocessing.Queue(-1)
-    listener = multiprocessing.Process(target=listener_process,
-                                       args=(queue, listener_configurer))
+
+    # Create and start listener process
+    listener = multiprocessing.Process(target=listener_process, args=(queue, listener_configurer))
     listener.start()
+
+    # Create and start 10 worker processes
     workers = []
-    for i in range(10):
-        worker = multiprocessing.Process(target=worker_process,
-                                         args=(queue, worker_configurer))
-        workers.append(worker)
-        worker.start()
-    for w in workers:
-        w.join()
+    for _ in range(10):
+        wrk = multiprocessing.Process(target=worker_process, args=(queue, worker_configurer))
+        workers.append(wrk)
+        wrk.start()
+
+    # Wait for all workers to finish
+    for wrk in workers:
+        wrk.join()
+
+    # Stop the listener process
     queue.put_nowait(None)
     listener.join()
+
 
 if __name__ == '__main__':
     main()
